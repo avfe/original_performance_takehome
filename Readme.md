@@ -1,3 +1,5 @@
+# (!) The threshold of 1487 cycles has been crossed, the current result is 1364 cycles. 
+
 # Anthropic's Original Performance Take-Home
 
 This repo contains a version of Anthropic's original performance take-home, before Claude Opus 4.5 started doing better than humans given only 2 hours.

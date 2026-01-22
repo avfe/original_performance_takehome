@@ -1,4 +1,4 @@
-# (!) The threshold of 1487 cycles has been crossed, the current result is 1363 cycles. 
+# (!!!!!) The threshold of 1487 cycles has been crossed, the current result is 1362 cycles. 
 
 # Anthropic's Original Performance Take-Home
 

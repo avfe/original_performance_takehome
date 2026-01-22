@@ -16,6 +16,7 @@ We recommend you look through problem.py next.
 import heapq
 import random
 import unittest
+from collections import defaultdict
 
 from problem import (
     Engine,
@@ -35,6 +36,8 @@ from problem import (
 
 
 class KernelBuilder:
+    GROUP_ORDER_SEED = None
+
     def __init__(self):
         self.scratch = {}
         self.scratch_debug = {}
@@ -46,7 +49,7 @@ class KernelBuilder:
         self.succs = []
         self.indeg = []
         self.last_writer = {}
-        self.last_reader = {}
+        self.last_readers = defaultdict(set)
         self.war_addrs = set()
         self.instrs = []
 
@@ -110,13 +113,11 @@ class KernelBuilder:
         for r in reads:
             if r in self.last_writer:
                 deps.add(self.last_writer[r])
-            if r in self.war_addrs and r in self.last_reader:
-                deps.add(self.last_reader[r])
         for w in writes:
             if w in self.last_writer:
                 deps.add(self.last_writer[w])
-            if w in self.war_addrs and w in self.last_reader:
-                deps.add(self.last_reader[w])
+            if w in self.war_addrs:
+                deps.update(self.last_readers.get(w, set()))
         op_id = len(self.engines)
         self.engines.append(engine)
         self.slots.append(slot)
@@ -126,11 +127,11 @@ class KernelBuilder:
             self.succs[dep].append(op_id)
         for r in reads:
             if r in self.war_addrs:
-                self.last_reader[r] = op_id
+                self.last_readers[r].add(op_id)
         for w in writes:
             self.last_writer[w] = op_id
-            if w in self.war_addrs and w in self.last_reader:
-                del self.last_reader[w]
+            if w in self.war_addrs:
+                self.last_readers.pop(w, None)
         return op_id
 
     def const(self, val, name=None):
@@ -156,6 +157,10 @@ class KernelBuilder:
 
     def schedule(self):
         n_ops = len(self.engines)
+        if n_ops == 0:
+            self.instrs = []
+            return
+
         inf = n_ops + 1
         load_dist = [inf] * n_ops
         for op_id in range(n_ops - 1, -1, -1):
@@ -166,65 +171,171 @@ class KernelBuilder:
                 if cand < load_dist[op_id]:
                     load_dist[op_id] = cand
 
-        indeg = self.indeg.copy()
-        ready = {}
-        for engine in SLOT_LIMITS:
-            if engine == "debug":
-                continue
-            ready[engine] = []
+        height = [0] * n_ops
+        for op_id in range(n_ops - 1, -1, -1):
+            best = 0
+            for succ in self.succs[op_id]:
+                cand = height[succ] + 1
+                if cand > best:
+                    best = cand
+            height[op_id] = best
 
-        def perm(engine, op_id):
-            if engine == "load":
-                return (op_id ^ (op_id >> 1)) & 0xFFFF
-            if engine == "alu":
+        engines = [e for e in SLOT_LIMITS if e != "debug"]
+
+        group_bases = getattr(self, "_group_bases", None)
+        group_size = getattr(self, "_group_size", None)
+
+        def group_for_dest(dest):
+            if group_bases is None or group_size is None:
+                return 1 << 30
+            for base in group_bases:
+                if base <= dest < base + group_size:
+                    return (dest - base) // VLEN
+            return 1 << 30
+
+        def gray2(x):
+            return (x ^ (x >> 1)) & 0xFFFF
+
+        def gray3(x):
+            return (x ^ (x >> 1) ^ (x >> 3)) & 0xFFFF
+
+        def mulmix(x):
+            return (x * 2654435761) & 0xFFFF
+
+        rand_seeds = getattr(
+            self,
+            "SCHED_RAND_SEEDS",
+            [17, 31, 47, 61, 79, 97, 113, 125, 131, 149],
+        )
+        rand_keys = []
+        for seed in rand_seeds:
+            rng = random.Random(seed)
+            rand_keys.append([rng.random() for _ in range(n_ops)])
+
+        def make_perm(load_key, valu_key):
+            def perm(engine, op_id):
+                if engine == "load":
+                    return load_key(op_id)
+                if engine == "valu":
+                    return valu_key(op_id)
+                if engine == "alu":
+                    return op_id
                 return op_id
-            if engine == "valu":
-                return -op_id
-            return op_id
 
-        for op_id, deg in enumerate(indeg):
-            if deg == 0:
-                engine = self.engines[op_id]
-                heapq.heappush(
-                    ready[engine],
-                    (load_dist[op_id], perm(engine, op_id), op_id),
-                )
+            return perm
 
-        instrs = []
-        while any(ready[engine] for engine in ready):
-            bundle = {}
-            next_ready = {engine: [] for engine in ready}
-            for engine, limit in SLOT_LIMITS.items():
-                if engine == "debug":
-                    continue
-                slots = []
-                for _ in range(limit):
-                    if not ready[engine]:
-                        break
-                    _, _, op_id = heapq.heappop(ready[engine])
-                    slots.append(op_id)
-                if slots:
-                    bundle[engine] = [self.slots[op_id] for op_id in slots]
-                    for op_id in slots:
-                        for succ in self.succs[op_id]:
-                            indeg[succ] -= 1
-                            if indeg[succ] == 0:
-                                succ_engine = self.engines[succ]
-                                heapq.heappush(
-                                    next_ready[succ_engine],
-                                    (
-                                        load_dist[succ],
-                                        perm(succ_engine, succ),
-                                        succ,
-                                    ),
-                                )
-            if bundle:
-                instrs.append(bundle)
-            for engine in ready:
-                if next_ready[engine]:
+        def valu_group_perm(op_id):
+            slot = self.slots[op_id]
+            dest = slot[1] if len(slot) > 1 else -1
+            return (group_for_dest(dest), op_id)
+
+        perms = [
+            make_perm(gray2, lambda op_id: -op_id),
+            make_perm(gray3, lambda op_id: -op_id),
+            make_perm(mulmix, lambda op_id: -op_id),
+            make_perm(gray2, lambda op_id: op_id),
+            make_perm(gray3, gray3),
+            make_perm(gray2, gray3),
+            make_perm(gray2, valu_group_perm),
+            make_perm(gray3, valu_group_perm),
+        ]
+        for rk in rand_keys:
+            perms.append(make_perm(lambda op_id, rk=rk: rk[op_id], lambda op_id: -op_id))
+        for rk in rand_keys:
+            perms.append(make_perm(gray2, lambda op_id, rk=rk: rk[op_id]))
+
+        orderings = [
+            ("load", "perm"),
+            ("load", "height", "perm"),
+            ("height", "load", "perm"),
+            ("height", "perm"),
+        ]
+
+        def make_key(order, perm_fn):
+            def key(engine, op_id):
+                fields = []
+                for field in order:
+                    if field == "load":
+                        fields.append(load_dist[op_id])
+                    elif field == "height":
+                        fields.append(-height[op_id])
+                    elif field == "perm":
+                        fields.append(perm_fn(engine, op_id))
+                fields.append(op_id)
+                return tuple(fields)
+
+            return key
+
+        keys = []
+        for perm_fn in perms:
+            for order in orderings:
+                keys.append(make_key(order, perm_fn))
+            def key_engine_split(engine, op_id, perm_fn=perm_fn):
+                if engine == "load":
+                    return (load_dist[op_id], perm_fn(engine, op_id), op_id)
+                if engine == "valu":
+                    return (-height[op_id], perm_fn(engine, op_id), op_id)
+                return (perm_fn(engine, op_id), op_id)
+            keys.append(key_engine_split)
+
+        def schedule_trial(key_fn, build_instrs):
+            indeg = self.indeg.copy()
+            ready = {engine: [] for engine in engines}
+
+            for op_id, deg in enumerate(indeg):
+                if deg == 0:
+                    engine = self.engines[op_id]
+                    heapq.heappush(
+                        ready[engine],
+                        key_fn(engine, op_id),
+                    )
+
+            instrs = []
+            cycles = 0
+
+            while any(ready[engine] for engine in ready):
+                bundle = {}
+                next_ready = {engine: [] for engine in ready}
+                for engine in engines:
+                    limit = SLOT_LIMITS[engine]
+                    slots = []
+                    for _ in range(limit):
+                        if not ready[engine]:
+                            break
+                        item = heapq.heappop(ready[engine])
+                        slots.append(item[-1])
+                    if slots:
+                        if build_instrs:
+                            bundle[engine] = [self.slots[op_id] for op_id in slots]
+                        for op_id in slots:
+                            for succ in self.succs[op_id]:
+                                indeg[succ] -= 1
+                                if indeg[succ] == 0:
+                                    succ_engine = self.engines[succ]
+                                    heapq.heappush(
+                                        next_ready[succ_engine],
+                                        key_fn(succ_engine, succ),
+                                    )
+                cycles += 1
+                if build_instrs:
+                    instrs.append(bundle)
+                for engine in ready:
                     for item in next_ready[engine]:
                         heapq.heappush(ready[engine], item)
-        self.instrs = instrs
+
+            return cycles, (instrs if build_instrs else None)
+
+        best_len = None
+        best_key = None
+        for key_fn in keys:
+            cand_len, _ = schedule_trial(key_fn, False)
+            if best_len is None or cand_len < best_len:
+                best_len = cand_len
+                best_key = key_fn
+
+        _, best_instrs = schedule_trial(best_key, True)
+        assert best_instrs is not None
+        self.instrs = best_instrs
 
     def build_kernel(
         self, forest_height: int, n_nodes: int, batch_size: int, rounds: int
@@ -233,6 +344,10 @@ class KernelBuilder:
         Vectorized kernel with DAG scheduling and multiply_add folding.
         """
         n_groups = batch_size // VLEN
+        group_order = list(range(n_groups))
+        if self.GROUP_ORDER_SEED is not None:
+            rng = random.Random(self.GROUP_ORDER_SEED)
+            rng.shuffle(group_order)
 
         idx_base = self.alloc_scratch("idx", batch_size)
         val_base = self.alloc_scratch("val", batch_size)
@@ -241,6 +356,9 @@ class KernelBuilder:
         aux_base = self.alloc_scratch("aux", batch_size)
         idx_addr_base = self.alloc_scratch("idx_addr", n_groups)
         val_addr_base = self.alloc_scratch("val_addr", n_groups)
+
+        self._group_bases = (idx_base, val_base, node_base, tmp_base, aux_base)
+        self._group_size = batch_size
 
         self.war_addrs = set(range(node_base, node_base + batch_size))
         self.war_addrs.update(range(tmp_base, tmp_base + batch_size))
@@ -274,7 +392,6 @@ class KernelBuilder:
                     (op, dest_vec + lane, src_vec + lane, shift_scalar),
                 )
 
-
         top_nodes = self.alloc_scratch("top_nodes", VLEN)
         self.emit_op("load", ("vload", top_nodes, forest_base))
 
@@ -301,8 +418,7 @@ class KernelBuilder:
         for g in range(1, n_groups):
             self.emit_op("alu", ("+", idx_addr_base + g, idx_addr_base + g - 1, vlen))
             self.emit_op("alu", ("+", val_addr_base + g, val_addr_base + g - 1, vlen))
-
-        for g in range(n_groups):
+        for g in group_order:
             idx_addr = idx_addr_base + g
             val_addr = val_addr_base + g
             idx_vec = idx_base + g * VLEN
@@ -312,7 +428,7 @@ class KernelBuilder:
 
         for r in range(rounds):
             depth = r % (forest_height + 1)
-            for g in range(n_groups):
+            for g in group_order:
                 idx_vec = idx_base + g * VLEN
                 val_vec = val_base + g * VLEN
                 node_vec = node_base + g * VLEN
@@ -370,9 +486,7 @@ class KernelBuilder:
                 self.emit_op("valu", ("^", val_vec, val_vec, tmp_vec))
 
                 if depth == forest_height:
-                    self.emit_op(
-                        "valu", ("^", idx_vec, idx_vec, idx_vec)
-                    )
+                    self.emit_op("valu", ("^", idx_vec, idx_vec, idx_vec))
                 else:
                     self.emit_op("valu", ("&", tmp_vec, val_vec, one_vec))
                     self.emit_op("valu", ("+", tmp_vec, tmp_vec, one_vec))
@@ -380,7 +494,7 @@ class KernelBuilder:
                         "valu", ("multiply_add", idx_vec, idx_vec, two_vec, tmp_vec)
                     )
 
-        for g in range(n_groups):
+        for g in group_order:
             idx_vec = idx_base + g * VLEN
             val_vec = val_base + g * VLEN
             self.emit_op("store", ("vstore", idx_addr_base + g, idx_vec))
@@ -388,7 +502,9 @@ class KernelBuilder:
 
         self.schedule()
 
+
 BASELINE = 147734
+
 
 def do_kernel_test(
     forest_height: int,

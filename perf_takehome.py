@@ -37,6 +37,8 @@ from problem import (
 
 class KernelBuilder:
     GROUP_ORDER_SEED = None
+    WAR_NODE = True
+    WAR_TMP = True
 
     def __init__(self):
         self.scratch = {}
@@ -360,8 +362,11 @@ class KernelBuilder:
         self._group_bases = (idx_base, val_base, node_base, tmp_base, aux_base)
         self._group_size = batch_size
 
-        self.war_addrs = set(range(node_base, node_base + batch_size))
-        self.war_addrs.update(range(tmp_base, tmp_base + batch_size))
+        self.war_addrs = set()
+        if self.WAR_NODE:
+            self.war_addrs.update(range(node_base, node_base + batch_size))
+        if self.WAR_TMP:
+            self.war_addrs.update(range(tmp_base, tmp_base + batch_size))
 
         forest_base = self.const(7, "forest_base")
         zero = self.const(0, "zero")
@@ -467,9 +472,9 @@ class KernelBuilder:
                     "valu",
                     ("multiply_add", val_vec, val_vec, mul4097_vec, add1_vec),
                 )
+                self.emit_op("valu", ("^", node_vec, val_vec, xor2_vec))
                 emit_shift(">>", tmp_vec, val_vec, shift19)
-                self.emit_op("valu", ("^", tmp_vec, tmp_vec, xor2_vec))
-                self.emit_op("valu", ("^", val_vec, val_vec, tmp_vec))
+                self.emit_op("valu", ("^", val_vec, node_vec, tmp_vec))
                 self.emit_op(
                     "valu",
                     ("multiply_add", val_vec, val_vec, mul33_vec, add3_vec),
@@ -481,9 +486,9 @@ class KernelBuilder:
                     "valu",
                     ("multiply_add", val_vec, val_vec, mul9_vec, add5_vec),
                 )
+                self.emit_op("valu", ("^", node_vec, val_vec, xor6_vec))
                 emit_shift(">>", tmp_vec, val_vec, shift16)
-                self.emit_op("valu", ("^", tmp_vec, tmp_vec, xor6_vec))
-                self.emit_op("valu", ("^", val_vec, val_vec, tmp_vec))
+                self.emit_op("valu", ("^", val_vec, node_vec, tmp_vec))
 
                 if depth == forest_height:
                     self.emit_op("valu", ("^", idx_vec, idx_vec, idx_vec))

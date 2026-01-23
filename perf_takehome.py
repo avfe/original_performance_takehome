@@ -36,7 +36,7 @@ from problem import (
 
 
 class KernelBuilder:
-    GROUP_ORDER_SEED = None
+    GROUP_ORDER_SEED = 10
     WAR_NODE = True
     WAR_TMP = True
 
